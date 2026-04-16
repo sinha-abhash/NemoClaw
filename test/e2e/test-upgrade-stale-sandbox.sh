@@ -7,7 +7,7 @@
 #
 # Reproduces the original reporter's scenario step-by-step:
 #
-#   1. Install an OLDER NemoClaw release (v0.0.16) via install.sh
+#   1. Install an OLDER NemoClaw release (v0.0.14) via install.sh
 #   2. Run onboard → creates a sandbox with the old OpenClaw version
 #   3. Upgrade to the CURRENT NemoClaw (this branch) via install.sh
 #   4. Run `nemoclaw upgrade-sandboxes --check`
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-OLD_NEMOCLAW_VERSION="v0.0.16"
+OLD_NEMOCLAW_VERSION="v0.0.14"
 SANDBOX_NAME="${NEMOCLAW_SANDBOX_NAME:-e2e-upgrade-stale}"
 REGISTRY_FILE="$HOME/.nemoclaw/sandboxes.json"
 
