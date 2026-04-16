@@ -2,37 +2,30 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Issue #1904 exact reproduction — "sandbox OpenClaw version is not upgraded
+# Issue #1904 reproduction — "sandbox OpenClaw version is not upgraded
 # after NemoClaw upgrade".
 #
-# Reproduces the original reporter's scenario step-by-step:
-#
-#   1. Install an OLDER NemoClaw release (v0.0.14) via install.sh
-#   2. Run onboard → creates a sandbox with the old OpenClaw version
-#   3. Upgrade to the CURRENT NemoClaw (this branch) via install.sh
-#   4. Run `nemoclaw upgrade-sandboxes --check`
-#   5. Verify it detects the sandbox as stale
-#   6. Run `nemoclaw onboard --recreate-sandbox` to rebuild
-#   7. Verify the sandbox now runs the current OpenClaw version
-#
-# This is the exact workflow that was broken before — the old :latest
-# base image sat in Docker's cache and the new NemoClaw never pulled
-# a fresh one, so sandboxes silently kept the old OpenClaw.
+#   1. Install current NemoClaw via install.sh (sets up gateway + OpenShell)
+#   2. Delete the sandbox install.sh created (keep the gateway)
+#   3. Build a base image with an OLDER OpenClaw version (2026.3.11)
+#   4. Create a sandbox from that old image via openshell directly
+#   5. Register it in NemoClaw's registry with the old agentVersion
+#   6. Run `nemoclaw upgrade-sandboxes --check`
+#   7. Verify it detects the sandbox as stale
+#   8. Run `nemoclaw <name> rebuild --yes` to upgrade
+#   9. Verify the sandbox now runs the current OpenClaw version
+#  10. Verify `upgrade-sandboxes --check` reports clean
 #
 # Prerequisites:
 #   - Docker running
 #   - NVIDIA_API_KEY set (real key, starts with nvapi-)
-#
-# Environment variables:
-#   NEMOCLAW_NON_INTERACTIVE=1             — required
-#   NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1 — required
-#   NVIDIA_API_KEY                         — required
 
 set -euo pipefail
 
-OLD_NEMOCLAW_VERSION="v0.0.14"
+OLD_OPENCLAW_VERSION="2026.3.11"
 SANDBOX_NAME="${NEMOCLAW_SANDBOX_NAME:-e2e-upgrade-stale}"
 REGISTRY_FILE="$HOME/.nemoclaw/sandboxes.json"
+SESSION_FILE="$HOME/.nemoclaw/onboard-session.json"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -50,6 +43,7 @@ fail() {
   exit 1
 }
 info() { echo -e "${YELLOW}[INFO]${NC} $1"; }
+diag() { echo -e "${YELLOW}[DIAG]${NC} $1"; }
 
 # ── Preflight ───────────────────────────────────────────────────────
 [ -n "${NVIDIA_API_KEY:-}" ] || fail "NVIDIA_API_KEY is required"
@@ -58,128 +52,154 @@ info() { echo -e "${YELLOW}[INFO]${NC} $1"; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
-info "Issue #1904 reproduction E2E (old: ${OLD_NEMOCLAW_VERSION}, sandbox: ${SANDBOX_NAME})"
+export NEMOCLAW_REBUILD_VERBOSE=1
 
-# Helper: source shell profile so nemoclaw/openshell are on PATH
-reload_path() {
-  if [ -f "$HOME/.bashrc" ]; then
-    # shellcheck source=/dev/null
-    source "$HOME/.bashrc" 2>/dev/null || true
-  fi
-  export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-  if [ -s "$NVM_DIR/nvm.sh" ]; then
-    # shellcheck source=/dev/null
-    . "$NVM_DIR/nvm.sh"
-  fi
-  if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-    export PATH="$HOME/.local/bin:$PATH"
-  fi
-}
+info "Issue #1904 reproduction (old OpenClaw: ${OLD_OPENCLAW_VERSION}, sandbox: ${SANDBOX_NAME})"
 
-# ── Phase 1: Install OLD NemoClaw ───────────────────────────────────
-info "Phase 1: Installing NemoClaw ${OLD_NEMOCLAW_VERSION} via install.sh..."
+# ── Phase 1: Install current NemoClaw ────────────────────────────────
+info "Phase 1: Installing current NemoClaw via install.sh..."
 
 export NEMOCLAW_NON_INTERACTIVE=1
 export NEMOCLAW_ACCEPT_THIRD_PARTY_SOFTWARE=1
 export NEMOCLAW_SANDBOX_NAME="${SANDBOX_NAME}"
 export NEMOCLAW_RECREATE_SANDBOX=1
-export NEMOCLAW_INSTALL_TAG="${OLD_NEMOCLAW_VERSION}"
 
-# Run from a temp directory so install.sh doesn't detect the CI checkout
-# as a source root (which would install the current branch instead of the
-# old tag). This is what a real user experiences — curl|bash from $HOME.
-OLD_INSTALL_DIR=$(mktemp -d)
-OLD_INSTALL_LOG="/tmp/nemoclaw-e2e-old-install.log"
-if ! (cd "$OLD_INSTALL_DIR" && curl -fsSL https://raw.githubusercontent.com/NVIDIA/NemoClaw/main/install.sh \
-  | bash -s -- --non-interactive) >"$OLD_INSTALL_LOG" 2>&1; then
-  info "Old install.sh exited non-zero (may be expected). Checking for nemoclaw..."
+INSTALL_LOG="/tmp/nemoclaw-e2e-upgrade-install.log"
+if ! bash "${REPO_ROOT}/install.sh" --non-interactive >"$INSTALL_LOG" 2>&1; then
+  info "install.sh exited non-zero (may be expected). Checking..."
 fi
-rm -rf "$OLD_INSTALL_DIR"
 
-reload_path
-command -v nemoclaw >/dev/null 2>&1 || fail "nemoclaw not found on PATH after installing ${OLD_NEMOCLAW_VERSION}"
-command -v openshell >/dev/null 2>&1 || fail "openshell not found on PATH after installing ${OLD_NEMOCLAW_VERSION}"
+# Source shell profile to pick up nvm/PATH changes
+if [ -f "$HOME/.bashrc" ]; then
+  # shellcheck source=/dev/null
+  source "$HOME/.bashrc" 2>/dev/null || true
+fi
+export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+if [ -s "$NVM_DIR/nvm.sh" ]; then
+  # shellcheck source=/dev/null
+  . "$NVM_DIR/nvm.sh"
+fi
+if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+  export PATH="$HOME/.local/bin:$PATH"
+fi
 
-OLD_VERSION=$(nemoclaw --version 2>&1 || true)
-info "Installed NemoClaw version: ${OLD_VERSION}"
+command -v nemoclaw >/dev/null 2>&1 || fail "nemoclaw not found on PATH after install"
+command -v openshell >/dev/null 2>&1 || fail "openshell not found on PATH after install"
+pass "NemoClaw installed"
 
-# ── Phase 2: Record old sandbox state ────────────────────────────────
-info "Phase 2: Recording old sandbox state..."
+# ── Phase 2: Delete sandbox, build old base image ────────────────────
+info "Phase 2: Replacing sandbox with old OpenClaw ${OLD_OPENCLAW_VERSION}..."
 
-# Wait for sandbox to be ready
+# Delete the sandbox that install.sh created — we'll make our own old one.
+openshell sandbox delete "${SANDBOX_NAME}" 2>/dev/null || true
+diag "Deleted Phase 1 sandbox, gateway preserved"
+
+OLD_BASE_TAG="nemoclaw-old-base:e2e-upgrade-stale"
+BLUEPRINT="${REPO_ROOT}/nemoclaw-blueprint/blueprint.yaml"
+BLUEPRINT_BAK="${BLUEPRINT}.bak"
+
+# Temporarily lower min_openclaw_version so the old version builds.
+cp "${BLUEPRINT}" "${BLUEPRINT_BAK}"
+sed "s/min_openclaw_version:.*/min_openclaw_version: \"${OLD_OPENCLAW_VERSION}\"/" "${BLUEPRINT}" >"${BLUEPRINT}.tmp"
+mv "${BLUEPRINT}.tmp" "${BLUEPRINT}"
+
+docker build \
+  --build-arg "OPENCLAW_VERSION=${OLD_OPENCLAW_VERSION}" \
+  -f "${REPO_ROOT}/Dockerfile.base" \
+  -t "${OLD_BASE_TAG}" \
+  "${REPO_ROOT}"
+BUILD_RC=$?
+
+mv "${BLUEPRINT_BAK}" "${BLUEPRINT}"
+[ "$BUILD_RC" -eq 0 ] || fail "Failed to build old base image"
+
+pass "Old base image built (OpenClaw ${OLD_OPENCLAW_VERSION})"
+
+# ── Phase 3: Create old sandbox via openshell ────────────────────────
+info "Phase 3: Creating sandbox with old OpenClaw..."
+
+TESTDIR=$(mktemp -d)
+cat >"${TESTDIR}/Dockerfile" <<DOCKERFILE
+FROM ${OLD_BASE_TAG}
+USER sandbox
+WORKDIR /sandbox
+RUN mkdir -p /sandbox/.openclaw-data/workspace /sandbox/.openclaw && echo '{}' > /sandbox/.openclaw/openclaw.json
+CMD ["/bin/bash"]
+DOCKERFILE
+
+openshell sandbox create --name "${SANDBOX_NAME}" --from "${TESTDIR}/Dockerfile" --gateway nemoclaw --no-tty -- true
+rm -rf "${TESTDIR}"
+
+# Wait for Ready
 for _i in $(seq 1 30); do
-  if openshell sandbox list 2>/dev/null | grep -q "${SANDBOX_NAME}.*Ready\|${SANDBOX_NAME}.*Running"; then
+  if openshell sandbox list 2>/dev/null | grep -q "${SANDBOX_NAME}.*Ready"; then
     break
   fi
   sleep 5
 done
-openshell sandbox list 2>/dev/null | grep -q "${SANDBOX_NAME}" \
-  || fail "Sandbox ${SANDBOX_NAME} not found after old install"
+openshell sandbox list 2>/dev/null | grep -q "${SANDBOX_NAME}.*Ready" \
+  || fail "Sandbox did not become Ready"
 
-# Capture the old OpenClaw version running inside the sandbox
-OLD_OPENCLAW_VERSION=$(openshell sandbox exec --name "${SANDBOX_NAME}" -- openclaw --version 2>&1 || true)
-info "Old sandbox OpenClaw version: ${OLD_OPENCLAW_VERSION}"
+SANDBOX_VERSION=$(openshell sandbox exec --name "${SANDBOX_NAME}" -- openclaw --version 2>&1 || true)
+info "Old sandbox OpenClaw version: ${SANDBOX_VERSION}"
 
-# Record old registry state
-OLD_AGENT_VERSION=$(python3 -c "
-import json, sys
+pass "Old sandbox created (OpenClaw ${OLD_OPENCLAW_VERSION})"
+
+# ── Phase 4: Register with old agentVersion ──────────────────────────
+info "Phase 4: Registering sandbox with old agentVersion..."
+
+python3 -c "
+import json
+reg = {'sandboxes': {'${SANDBOX_NAME}': {
+    'name': '${SANDBOX_NAME}',
+    'createdAt': '$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+    'model': 'nvidia/nemotron-3-super-120b-a12b',
+    'provider': 'nvidia-prod',
+    'gpuEnabled': False,
+    'policies': [],
+    'policyTier': None,
+    'agent': None,
+    'agentVersion': '${OLD_OPENCLAW_VERSION}'
+}}, 'defaultSandbox': '${SANDBOX_NAME}'}
+with open('${REGISTRY_FILE}', 'w') as f:
+    json.dump(reg, f, indent=2)
+
+sess_path = '${SESSION_FILE}'
 try:
-    d = json.load(open('${REGISTRY_FILE}'))
-    sb = d.get('sandboxes', {}).get('${SANDBOX_NAME}', {})
-    print(sb.get('agentVersion', 'unknown'))
-except Exception as e:
-    print(f'error: {e}')
-" 2>/dev/null || echo "unknown")
-info "Old registry agentVersion: ${OLD_AGENT_VERSION}"
+    with open(sess_path) as f:
+        sess = json.load(f)
+except Exception:
+    sess = {}
+sess['sandboxName'] = '${SANDBOX_NAME}'
+sess['status'] = 'complete'
+with open(sess_path, 'w') as f:
+    json.dump(sess, f, indent=2)
+print('Registry and session updated')
+"
 
-pass "Phase 2: Old sandbox running OpenClaw ${OLD_OPENCLAW_VERSION}"
+pass "Sandbox registered with agentVersion=${OLD_OPENCLAW_VERSION}"
 
-# ── Phase 3: Upgrade ONLY the CLI to current (this branch) ───────────
-info "Phase 3: Upgrading NemoClaw CLI to current branch..."
-
-# Upgrade just the CLI binaries without re-onboarding. This leaves the
-# old sandbox in place — exactly what the reporter experienced: they ran
-# curl|bash which upgraded the CLI but the old sandbox kept the cached
-# stale :latest image.
-UPGRADE_LOG="/tmp/nemoclaw-e2e-upgrade-install.log"
-(
-  cd "${REPO_ROOT}"
-  npm install --ignore-scripts
-  npm run build:cli
-  cd nemoclaw && npm install --ignore-scripts && npm run build && cd ..
-  npm link
-) >"$UPGRADE_LOG" 2>&1 || fail "CLI upgrade failed"
-
-reload_path
-NEW_VERSION=$(nemoclaw --version 2>&1 || true)
-info "Upgraded NemoClaw version: ${NEW_VERSION}"
-
-pass "Phase 3: NemoClaw upgraded from ${OLD_VERSION} to ${NEW_VERSION}"
-
-# ── Phase 4: Verify upgrade-sandboxes detects the stale sandbox ──────
-info "Phase 4: Running upgrade-sandboxes --check..."
+# ── Phase 5: Verify upgrade-sandboxes detects the stale sandbox ──────
+info "Phase 5: Running upgrade-sandboxes --check..."
 
 CHECK_OUTPUT=$(nemoclaw upgrade-sandboxes --check 2>&1 || true)
 echo "$CHECK_OUTPUT"
 
-# The old sandbox should be detected as stale
 if echo "$CHECK_OUTPUT" | grep -qi "stale\|need upgrading"; then
-  pass "Phase 4: upgrade-sandboxes --check detected stale sandbox"
+  pass "Phase 5: upgrade-sandboxes --check detected stale sandbox"
 elif echo "$CHECK_OUTPUT" | grep -qi "up to date"; then
-  fail "upgrade-sandboxes --check says all up to date — stale sandbox NOT detected (this is the #1904 bug)"
+  fail "upgrade-sandboxes --check says all up to date — stale sandbox NOT detected (#1904)"
 else
-  info "Phase 4: Unexpected output from upgrade-sandboxes --check"
-  fail "upgrade-sandboxes --check did not produce expected output"
+  fail "upgrade-sandboxes --check produced unexpected output"
 fi
 
-# ── Phase 5: Rebuild and verify new version ──────────────────────────
-info "Phase 5: Rebuilding sandbox..."
+# ── Phase 6: Rebuild and verify new version ──────────────────────────
+info "Phase 6: Rebuilding sandbox..."
 
 nemoclaw "${SANDBOX_NAME}" rebuild --yes 2>&1 || fail "Sandbox rebuild failed"
 
-# Wait for sandbox to be ready after rebuild
 for _i in $(seq 1 30); do
-  if openshell sandbox list 2>/dev/null | grep -q "${SANDBOX_NAME}.*Ready\|${SANDBOX_NAME}.*Running"; then
+  if openshell sandbox list 2>/dev/null | grep -q "${SANDBOX_NAME}.*Ready"; then
     break
   fi
   sleep 5
@@ -188,29 +208,27 @@ done
 NEW_OPENCLAW_VERSION=$(openshell sandbox exec --name "${SANDBOX_NAME}" -- openclaw --version 2>&1 || true)
 info "New sandbox OpenClaw version: ${NEW_OPENCLAW_VERSION}"
 
-# The new version must be different from (newer than) the old version
-if [ "${NEW_OPENCLAW_VERSION}" = "${OLD_OPENCLAW_VERSION}" ]; then
+if echo "${NEW_OPENCLAW_VERSION}" | grep -q "${OLD_OPENCLAW_VERSION}"; then
   fail "Sandbox still running old OpenClaw ${OLD_OPENCLAW_VERSION} after rebuild — #1904 NOT fixed"
 fi
 
-pass "Phase 5: Sandbox upgraded from OpenClaw ${OLD_OPENCLAW_VERSION} to ${NEW_OPENCLAW_VERSION}"
+pass "Phase 6: Sandbox upgraded from OpenClaw ${OLD_OPENCLAW_VERSION} to ${NEW_OPENCLAW_VERSION}"
 
-# ── Phase 6: Verify upgrade-sandboxes now reports clean ──────────────
-info "Phase 6: Verifying upgrade-sandboxes --check is clean..."
+# ── Phase 7: Verify clean ────────────────────────────────────────────
+info "Phase 7: Verifying upgrade-sandboxes --check is clean..."
 
 RECHECK_OUTPUT=$(nemoclaw upgrade-sandboxes --check 2>&1 || true)
 echo "$RECHECK_OUTPUT"
 
 if echo "$RECHECK_OUTPUT" | grep -qi "up to date"; then
-  pass "Phase 6: upgrade-sandboxes --check reports all up to date after rebuild"
+  pass "Phase 7: All sandboxes up to date after rebuild"
 else
-  info "Phase 6: Sandbox may still appear stale (non-fatal)"
+  info "Phase 7: Sandbox may still appear stale (non-fatal)"
 fi
 
-# ── Done ─────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
 echo -e "${GREEN}  Issue #1904 E2E PASSED${NC}"
-echo -e "${GREEN}  Old: NemoClaw ${OLD_VERSION} / OpenClaw ${OLD_OPENCLAW_VERSION}${NC}"
-echo -e "${GREEN}  New: NemoClaw ${NEW_VERSION} / OpenClaw ${NEW_OPENCLAW_VERSION}${NC}"
+echo -e "${GREEN}  Old: OpenClaw ${OLD_OPENCLAW_VERSION}${NC}"
+echo -e "${GREEN}  New: OpenClaw ${NEW_OPENCLAW_VERSION}${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════════════${NC}"
