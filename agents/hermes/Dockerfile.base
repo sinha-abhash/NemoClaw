@@ -23,7 +23,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Hermes version pinned for reproducibility.
 # Calver tag v2026.4.8 = semver 0.8.0.
-ARG HERMES_VERSION=v2026.4.8
+ARG HERMES_VERSION=v2026.4.13
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3=3.11.2-1+b1 \
