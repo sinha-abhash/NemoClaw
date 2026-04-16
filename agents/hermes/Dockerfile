@@ -21,6 +21,9 @@ RUN (apt-get remove --purge -y gcc gcc-12 g++ g++-12 cpp cpp-12 make \
 # (decode-proxy → OpenShell L7 proxy) handles credential placeholder
 # rewriting and hostname-based policy enforcement. No monkey patch needed.
 ENV HERMES_TELEGRAM_DISABLE_FALLBACK_IPS=1
+# hadolint ignore=DL4006
+RUN hermes --version | grep -qE '2026\.4\.(1[3-9]|[2-9][0-9])|2026\.([5-9]|1[0-9])\.|202[7-9]\.' \
+    || (echo "ERROR: Hermes too old for HERMES_TELEGRAM_DISABLE_FALLBACK_IPS (need >= v2026.4.13)" >&2; exit 1)
 
 # Copy NemoClaw plugin for Hermes (Python-based)
 COPY agents/hermes/plugin/ /opt/nemoclaw-hermes-plugin/
