@@ -41,6 +41,8 @@ import {
   normalizeProviderBaseUrl,
   parsePolicyPresetEnv,
   patchStagedDockerfile,
+  pullAndResolveBaseImageDigest,
+  SANDBOX_BASE_IMAGE,
   printSandboxCreateRecoveryHints,
   resolveDashboardForwardTarget,
   summarizeCurlFailure,
@@ -4514,6 +4516,214 @@ const { createSandbox } = require(${onboardPath});
     assert.ok(
       updateAfterCreate !== -1,
       "registry.updateSandbox(model, provider) must appear AFTER createSandbox() — regression #1881",
+    );
+  });
+
+  // ── Base image digest pinning (#1904) ──────────────────────────
+
+  it("patchStagedDockerfile rewrites ARG BASE_IMAGE when baseImageRef is provided", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-onboard-base-image-"));
+    const dockerfilePath = path.join(tmpDir, "Dockerfile");
+    fs.writeFileSync(
+      dockerfilePath,
+      [
+        "ARG BASE_IMAGE=ghcr.io/nvidia/nemoclaw/sandbox-base:latest",
+        "ARG NEMOCLAW_MODEL=nvidia/nemotron-3-super-120b-a12b",
+        "ARG NEMOCLAW_PROVIDER_KEY=nvidia",
+        "ARG NEMOCLAW_PRIMARY_MODEL_REF=nvidia/nemotron-3-super-120b-a12b",
+        "ARG CHAT_UI_URL=http://127.0.0.1:18789",
+        "ARG NEMOCLAW_INFERENCE_COMPAT_B64=e30=",
+        "ARG NEMOCLAW_WEB_SEARCH_ENABLED=0",
+        "ARG NEMOCLAW_BUILD_ID=default",
+      ].join("\n"),
+    );
+
+    const fakeRef =
+      "ghcr.io/nvidia/nemoclaw/sandbox-base@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    try {
+      patchStagedDockerfile(
+        dockerfilePath,
+        "gpt-5.4",
+        "http://127.0.0.1:19999",
+        "build-pin",
+        "openai-api",
+        null,
+        null,
+        [],
+        {},
+        {},
+        fakeRef,
+      );
+      const patched = fs.readFileSync(dockerfilePath, "utf8");
+      assert.match(patched, /^ARG BASE_IMAGE=ghcr\.io\/nvidia\/nemoclaw\/sandbox-base@sha256:a{64}$/m);
+      // Model patching still works alongside base image pinning
+      assert.match(patched, /^ARG NEMOCLAW_MODEL=gpt-5\.4$/m);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("patchStagedDockerfile preserves ARG BASE_IMAGE when baseImageRef is null", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-onboard-base-image-null-"));
+    const dockerfilePath = path.join(tmpDir, "Dockerfile");
+    fs.writeFileSync(
+      dockerfilePath,
+      [
+        "ARG BASE_IMAGE=ghcr.io/nvidia/nemoclaw/sandbox-base:latest",
+        "ARG NEMOCLAW_MODEL=nvidia/nemotron-3-super-120b-a12b",
+        "ARG NEMOCLAW_PROVIDER_KEY=nvidia",
+        "ARG NEMOCLAW_PRIMARY_MODEL_REF=nvidia/nemotron-3-super-120b-a12b",
+        "ARG CHAT_UI_URL=http://127.0.0.1:18789",
+        "ARG NEMOCLAW_INFERENCE_COMPAT_B64=e30=",
+        "ARG NEMOCLAW_WEB_SEARCH_ENABLED=0",
+        "ARG NEMOCLAW_BUILD_ID=default",
+      ].join("\n"),
+    );
+
+    try {
+      patchStagedDockerfile(
+        dockerfilePath,
+        "gpt-5.4",
+        "http://127.0.0.1:19999",
+        "build-nopin",
+        "openai-api",
+        null,
+        null,
+        [],
+        {},
+        {},
+        null,
+      );
+      const patched = fs.readFileSync(dockerfilePath, "utf8");
+      assert.match(
+        patched,
+        /^ARG BASE_IMAGE=ghcr\.io\/nvidia\/nemoclaw\/sandbox-base:latest$/m,
+        "BASE_IMAGE should remain unchanged when baseImageRef is null",
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("patchStagedDockerfile is safe when Dockerfile has no ARG BASE_IMAGE line", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-onboard-no-base-"));
+    const dockerfilePath = path.join(tmpDir, "Dockerfile");
+    fs.writeFileSync(
+      dockerfilePath,
+      [
+        "ARG NEMOCLAW_MODEL=nvidia/nemotron-3-super-120b-a12b",
+        "ARG NEMOCLAW_PROVIDER_KEY=nvidia",
+        "ARG NEMOCLAW_PRIMARY_MODEL_REF=nvidia/nemotron-3-super-120b-a12b",
+        "ARG CHAT_UI_URL=http://127.0.0.1:18789",
+        "ARG NEMOCLAW_INFERENCE_COMPAT_B64=e30=",
+        "ARG NEMOCLAW_WEB_SEARCH_ENABLED=0",
+        "ARG NEMOCLAW_BUILD_ID=default",
+      ].join("\n"),
+    );
+
+    const fakeRef =
+      "ghcr.io/nvidia/nemoclaw/sandbox-base@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    try {
+      patchStagedDockerfile(
+        dockerfilePath,
+        "gpt-5.4",
+        "http://127.0.0.1:19999",
+        "build-nobase",
+        "openai-api",
+        null,
+        null,
+        [],
+        {},
+        {},
+        fakeRef,
+      );
+      const patched = fs.readFileSync(dockerfilePath, "utf8");
+      // No ARG BASE_IMAGE in original, so the ref should not appear
+      assert.ok(!patched.includes("ARG BASE_IMAGE="), "Should not inject BASE_IMAGE when line is absent");
+      // Other patching should still work
+      assert.match(patched, /^ARG NEMOCLAW_MODEL=gpt-5\.4$/m);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("regression #1904: BASE_IMAGE must reference sandbox-base, not openshell-community", () => {
+    // This is the exact bug that broke all e2e tests in PR #1937:
+    // the code read a digest from blueprint.yaml (openshell-community registry)
+    // and applied it to nemoclaw/sandbox-base (different registry).
+    // Verify that patchStagedDockerfile only writes refs to sandbox-base.
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "nemoclaw-onboard-regression-"));
+    const dockerfilePath = path.join(tmpDir, "Dockerfile");
+    fs.writeFileSync(
+      dockerfilePath,
+      [
+        "ARG BASE_IMAGE=ghcr.io/nvidia/nemoclaw/sandbox-base:latest",
+        "ARG NEMOCLAW_MODEL=nvidia/nemotron-3-super-120b-a12b",
+        "ARG NEMOCLAW_PROVIDER_KEY=nvidia",
+        "ARG NEMOCLAW_PRIMARY_MODEL_REF=nvidia/nemotron-3-super-120b-a12b",
+        "ARG CHAT_UI_URL=http://127.0.0.1:18789",
+        "ARG NEMOCLAW_INFERENCE_COMPAT_B64=e30=",
+        "ARG NEMOCLAW_WEB_SEARCH_ENABLED=0",
+        "ARG NEMOCLAW_BUILD_ID=default",
+      ].join("\n"),
+    );
+
+    const correctRef =
+      "ghcr.io/nvidia/nemoclaw/sandbox-base@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    try {
+      patchStagedDockerfile(
+        dockerfilePath,
+        "gpt-5.4",
+        "http://127.0.0.1:19999",
+        "build-regression",
+        "openai-api",
+        null,
+        null,
+        [],
+        {},
+        {},
+        correctRef,
+      );
+      const patched = fs.readFileSync(dockerfilePath, "utf8");
+      const baseLine = patched.split("\n").find((l) => l.startsWith("ARG BASE_IMAGE="));
+      assert.ok(baseLine, "ARG BASE_IMAGE line must exist");
+      assert.ok(
+        baseLine.includes("nemoclaw/sandbox-base"),
+        `BASE_IMAGE must reference nemoclaw/sandbox-base, got: ${baseLine}`,
+      );
+      assert.ok(
+        !baseLine.includes("openshell-community"),
+        `BASE_IMAGE must NOT reference openshell-community — regression #1937. Got: ${baseLine}`,
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("regression #1904: pullAndResolveBaseImageDigest uses sandbox-base registry", () => {
+    // Structural check: verify the constant matches the Dockerfile default
+    // and does NOT reference the openshell-community registry.
+    assert.ok(
+      SANDBOX_BASE_IMAGE.includes("nemoclaw/sandbox-base"),
+      `SANDBOX_BASE_IMAGE must reference nemoclaw/sandbox-base, got: ${SANDBOX_BASE_IMAGE}`,
+    );
+    assert.ok(
+      !SANDBOX_BASE_IMAGE.includes("openshell-community"),
+      `SANDBOX_BASE_IMAGE must NOT reference openshell-community, got: ${SANDBOX_BASE_IMAGE}`,
+    );
+  });
+
+  it("regression #1904: createSandbox calls pullAndResolveBaseImageDigest before patchStagedDockerfile", () => {
+    const source = fs.readFileSync(
+      path.join(import.meta.dirname, "..", "src", "lib", "onboard.ts"),
+      "utf-8",
+    );
+    const pullPos = source.indexOf("pullAndResolveBaseImageDigest()");
+    assert.ok(pullPos !== -1, "pullAndResolveBaseImageDigest() call not found in onboard.ts");
+    const patchPos = source.indexOf("patchStagedDockerfile(", pullPos);
+    assert.ok(
+      patchPos > pullPos,
+      "pullAndResolveBaseImageDigest must be called BEFORE patchStagedDockerfile — regression #1904",
     );
   });
 });

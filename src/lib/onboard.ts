@@ -454,6 +454,48 @@ function getBlueprintMaxOpenshellVersion(rootDir = ROOT) {
   return getBlueprintVersionField("max_openshell_version", rootDir);
 }
 
+// ── Base image digest resolution ────────────────────────────────
+// Pulls the sandbox-base image from GHCR and inspects it to get the
+// actual repo digest. This avoids the registry mismatch that broke
+// e2e tests in #1937 — the digest always comes from the same registry
+// we're pinning to. See #1904.
+
+const SANDBOX_BASE_IMAGE = "ghcr.io/nvidia/nemoclaw/sandbox-base";
+const SANDBOX_BASE_TAG = "latest";
+
+/**
+ * Pull sandbox-base:latest from GHCR and resolve its repo digest.
+ * Returns { digest, ref } on success, or null when the pull or
+ * inspect fails (offline, GHCR outage, local-only build).
+ */
+function pullAndResolveBaseImageDigest() {
+  const imageWithTag = `${SANDBOX_BASE_IMAGE}:${SANDBOX_BASE_TAG}`;
+  try {
+    run(["docker", "pull", imageWithTag], { suppressOutput: true });
+  } catch {
+    // Pull failed — caller should fall back to unpin :latest
+    return null;
+  }
+
+  let inspectOutput;
+  try {
+    inspectOutput = runCapture(
+      ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", imageWithTag],
+      { ignoreError: false },
+    );
+  } catch {
+    return null;
+  }
+
+  // inspectOutput looks like "ghcr.io/nvidia/nemoclaw/sandbox-base@sha256:abc123..."
+  const match = (inspectOutput || "").match(/sha256:[0-9a-f]{64}/);
+  if (!match) return null;
+
+  const digest = match[0];
+  const ref = `${SANDBOX_BASE_IMAGE}@${digest}`;
+  return { digest, ref };
+}
+
 function getStableGatewayImageRef(versionOutput = null) {
   const version = getInstalledOpenshellVersion(versionOutput);
   if (!version) return null;
@@ -991,10 +1033,17 @@ function patchStagedDockerfile(
   messagingChannels = [],
   messagingAllowedIds = {},
   discordGuilds = {},
+  baseImageRef = null,
 ) {
   const { providerKey, primaryModelRef, inferenceBaseUrl, inferenceApi, inferenceCompat } =
     getSandboxInferenceConfig(model, provider, preferredInferenceApi);
   let dockerfile = fs.readFileSync(dockerfilePath, "utf8");
+  // Pin the base image to a specific digest when available (#1904).
+  // The ref must come from pullAndResolveBaseImageDigest() — never from
+  // blueprint.yaml, whose digest belongs to a different registry.
+  if (baseImageRef) {
+    dockerfile = dockerfile.replace(/^ARG BASE_IMAGE=.*$/m, `ARG BASE_IMAGE=${baseImageRef}`);
+  }
   dockerfile = dockerfile.replace(/^ARG NEMOCLAW_MODEL=.*$/m, `ARG NEMOCLAW_MODEL=${model}`);
   dockerfile = dockerfile.replace(
     /^ARG NEMOCLAW_PROVIDER_KEY=.*$/m,
@@ -2734,6 +2783,15 @@ async function createSandbox(
       };
     }
   }
+  // Pull the base image and resolve its digest so the Dockerfile is pinned to
+  // exactly what we just fetched. This prevents stale :latest tags from
+  // silently reusing a cached old image after NemoClaw upgrades (#1904).
+  const resolved = pullAndResolveBaseImageDigest();
+  if (resolved) {
+    console.log(`  Pinning base image to ${resolved.digest.slice(0, 19)}...`);
+  } else {
+    console.warn("  Warning: could not pull base image from registry; using cached :latest.");
+  }
   patchStagedDockerfile(
     stagedDockerfile,
     model,
@@ -2745,6 +2803,7 @@ async function createSandbox(
     activeMessagingChannels,
     messagingAllowedIds,
     discordGuilds,
+    resolved ? resolved.ref : null,
   );
   // Only pass non-sensitive env vars to the sandbox. Credentials flow through
   // OpenShell providers — the gateway injects them as placeholders and the L7
@@ -5468,6 +5527,9 @@ module.exports = {
   getInstalledOpenshellVersion,
   getBlueprintMinOpenshellVersion,
   getBlueprintMaxOpenshellVersion,
+  pullAndResolveBaseImageDigest,
+  SANDBOX_BASE_IMAGE,
+  SANDBOX_BASE_TAG,
   versionGte,
   getRequestedModelHint,
   getRequestedProviderHint,
