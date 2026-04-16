@@ -134,15 +134,21 @@ info "Old registry agentVersion: ${OLD_AGENT_VERSION}"
 
 pass "Phase 2: Old sandbox running OpenClaw ${OLD_OPENCLAW_VERSION}"
 
-# ── Phase 3: Upgrade to CURRENT NemoClaw (this branch) ───────────────
-info "Phase 3: Upgrading NemoClaw to current branch..."
+# ── Phase 3: Upgrade ONLY the CLI to current (this branch) ───────────
+info "Phase 3: Upgrading NemoClaw CLI to current branch..."
 
-unset NEMOCLAW_INSTALL_TAG
-# Install from the local repo checkout (this branch with the fix)
+# Upgrade just the CLI binaries without re-onboarding. This leaves the
+# old sandbox in place — exactly what the reporter experienced: they ran
+# curl|bash which upgraded the CLI but the old sandbox kept the cached
+# stale :latest image.
 UPGRADE_LOG="/tmp/nemoclaw-e2e-upgrade-install.log"
-if ! bash "${REPO_ROOT}/install.sh" --non-interactive >"$UPGRADE_LOG" 2>&1; then
-  info "Upgrade install.sh exited non-zero. Checking..."
-fi
+(
+  cd "${REPO_ROOT}"
+  npm install --ignore-scripts
+  npm run build:cli
+  cd nemoclaw && npm install --ignore-scripts && npm run build && cd ..
+  npm link
+) >"$UPGRADE_LOG" 2>&1 || fail "CLI upgrade failed"
 
 reload_path
 NEW_VERSION=$(nemoclaw --version 2>&1 || true)
