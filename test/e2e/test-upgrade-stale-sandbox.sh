@@ -85,11 +85,16 @@ export NEMOCLAW_SANDBOX_NAME="${SANDBOX_NAME}"
 export NEMOCLAW_RECREATE_SANDBOX=1
 export NEMOCLAW_INSTALL_TAG="${OLD_NEMOCLAW_VERSION}"
 
+# Run from a temp directory so install.sh doesn't detect the CI checkout
+# as a source root (which would install the current branch instead of the
+# old tag). This is what a real user experiences — curl|bash from $HOME.
+OLD_INSTALL_DIR=$(mktemp -d)
 OLD_INSTALL_LOG="/tmp/nemoclaw-e2e-old-install.log"
-if ! curl -fsSL https://raw.githubusercontent.com/NVIDIA/NemoClaw/main/install.sh \
-  | bash -s -- --non-interactive >"$OLD_INSTALL_LOG" 2>&1; then
+if ! (cd "$OLD_INSTALL_DIR" && curl -fsSL https://raw.githubusercontent.com/NVIDIA/NemoClaw/main/install.sh \
+  | bash -s -- --non-interactive) >"$OLD_INSTALL_LOG" 2>&1; then
   info "Old install.sh exited non-zero (may be expected). Checking for nemoclaw..."
 fi
+rm -rf "$OLD_INSTALL_DIR"
 
 reload_path
 command -v nemoclaw >/dev/null 2>&1 || fail "nemoclaw not found on PATH after installing ${OLD_NEMOCLAW_VERSION}"
